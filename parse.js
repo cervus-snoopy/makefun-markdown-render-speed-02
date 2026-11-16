@@ -1,35 +1,42 @@
-// parse.js — drop-in replacement for marked 18.1.3 (default options: gfm,
-// breaks false, pedantic false, async false). Written from scratch against
-// marked's observable behaviour; output must be byte-identical to marked's
-// on every input. MIT license (see LICENSE).
+// parse.js — a from-scratch drop-in for marked 18.1.3 (defaults: gfm on,
+// breaks off, pedantic off, synchronous). Output must match marked byte
+// for byte on every input.
 //
-// Architecture: a line-based block parser builds a small tree, an inline
-// parser (delimiter stack) renders inline content, and renderers emit the
-// exact HTML marked emits. No dependencies, no regexes on hot paths where a
-// hand scan is cheaper.
+// How it works: a line-oriented block parser builds a small tree, a
+// delimiter-stack inline parser renders inline content, and small render
+// functions emit marked's exact HTML. No dependencies.
+//
+// Tabs: a tab's width is always relative to the ABSOLUTE column where the
+// text sits, not to the start of the current string slice. Container cuts
+// (quotes, item indents) can straddle a tab, so the block parser tracks a
+// virtual text start: an absolute column plus a count of pad spaces that
+// stand in for the leftover columns of a straddled tab. Helpers that
+// measure or strip leading whitespace take a `base` (absolute column).
 
 // ---------------------------------------------------------------------------
-// Part 1 — shared helpers
+// Part 1 — character and string helpers
 // ---------------------------------------------------------------------------
 
 function isSpace(c) { return c === 32 || c === 9 || c === 10 || c === 13; }
 function isDigit(c) { return c >= 48 && c <= 57; }
-function isAlphaNum(c) { return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122); }
-// ASCII punctuation (CommonMark): !"#$%&'()*+,-./:;<=>?@[\]^_`{|}~
-function isPunct(c) {
-  return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+function isAlphaNum(c) {
+  return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
 }
-// Unicode whitespace for emphasis flanking (includes NBSP and other
-// Unicode spaces, which ASCII isSpace misses).
+// ASCII punctuation per CommonMark: !"#$%&'()*+,-./:;<=>?@[\]^_`{|}~
+function isPunct(c) {
+  return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) ||
+    (c >= 91 && c <= 96) || (c >= 123 && c <= 126);
+}
+// Whitespace for emphasis flanking: ASCII whitespace plus NBSP and the
+// other Unicode spaces (ASCII isSpace alone misses them).
 function isFlankSpace(c) {
   return c === 32 || c === 9 || c === 10 || c === 13 || c === 11 || c === 12 ||
     c === 0xA0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200A) ||
     c === 0x2028 || c === 0x2029 || c === 0x202F || c === 0x205F ||
     c === 0x3000 || c === 0xFEFF;
 }
-// Unicode punctuation/symbols for emphasis flanking: ASCII punctuation
-// plus Unicode punctuation (P) and symbols (S, incl. currency like £ € $).
-// Surrogates (astral halves) are never punctuation here.
+// Unicode punctuation (P) and symbols (S, including currency like £ € $)
+// for emphasis flanking. Astral surrogates are never punctuation here.
 const FLANK_PUNCT_RE = /[\p{P}\p{S}]/u;
 function isFlankPunct(c) {
   if (c >= 0xD800 && c <= 0xDFFF) return false;
@@ -53,8 +60,8 @@ function escapeHtml(s) {
   return start === 0 ? s : out + s.slice(start);
 }
 
-// Decode a numeric character reference body (after '&#' or '&#x'), returning
-// the replacement character, or null if the body is not a valid numeric ref.
+// Decode a numeric character-reference body (after '&#' or '&#x').
+// Returns the character, or null when the body is not a valid ref.
 function decodeNumericEntity(body) {
   let n;
   if (body[0] === 'x' || body[0] === 'X') {
@@ -69,9 +76,9 @@ function decodeNumericEntity(body) {
   return String.fromCodePoint(n);
 }
 
-// Encode a URL the way marked does: control chars dropped, then encodeURI
-// percent-encoding (space -> %20, " -> %22, \ -> %5C, non-ASCII as UTF-8),
-// then HTML-escape & (unless part of a valid entity) and ' -> &#39;.
+// Encode a URL the way marked does: drop control chars, percent-encode
+// with encodeURI (space -> %20, " -> %22, \ -> %5C, non-ASCII as UTF-8),
+// then HTML-escape & (unless it starts a valid entity) and ' -> &#39;.
 function cleanUrl(href) {
   let s = '';
   for (let i = 0; i < href.length; i++) {
@@ -79,8 +86,8 @@ function cleanUrl(href) {
     if (c < 32 || c === 127) continue;
     s += href[i];
   }
-  // Encode each segment separately so valid %XX sequences are preserved
-  // (encodeURI would re-encode '%' to '%25').
+  // Encode segment by segment so valid %XX sequences survive (a plain
+  // encodeURI would re-encode '%' itself to '%25').
   const parts = s.split(/(%[0-9A-Fa-f]{2})/g);
   let u = '';
   for (const part of parts) {
@@ -106,7 +113,7 @@ function cleanUrl(href) {
 }
 
 // Escape an HTML attribute value: " ' < > and & (unless & starts a valid
-// entity, which is preserved).
+// entity, which is kept as-is).
 function escapeAttr(s) {
   let res = '', start = 0;
   for (let i = 0; i < s.length; i++) {
@@ -127,14 +134,15 @@ function unescapeStr(s) {
   if (s.indexOf('\\') === -1) return s;
   let out = '';
   for (let i = 0; i < s.length; i++) {
-    if (s.charCodeAt(i) === 92 && i + 1 < s.length && isPunct(s.charCodeAt(i + 1))) { out += s[i + 1]; i++; }
-    else out += s[i];
+    if (s.charCodeAt(i) === 92 && i + 1 < s.length && isPunct(s.charCodeAt(i + 1))) {
+      out += s[i + 1]; i++;
+    } else out += s[i];
   }
   return out;
 }
 
-// Split source into lines; CRLF and lone CR become LF. The final line has
-// no terminator.
+// Split source into lines; CRLF and lone CR become LF. A trailing empty
+// line (source ending with a newline) is dropped.
 function splitLines(src) {
   src = src.replace(/\r\n?/g, '\n');
   const lines = src.split('\n');
@@ -142,20 +150,21 @@ function splitLines(src) {
   return lines;
 }
 
-// Column width of the leading whitespace of `s` (tab = next multiple of 4)
-// and the number of leading whitespace characters.
-function indentCols(s) {
+// Width in columns of the leading whitespace of `s` (a tab jumps to the
+// next multiple of 4, measured from `base`, the absolute column where `s`
+// starts) and the number of leading whitespace characters.
+function indentCols(s, base = 0) {
   let col = 0, i = 0;
   while (i < s.length) {
     const c = s.charCodeAt(i);
     if (c === 32) { col++; i++; }
-    else if (c === 9) { col += 4 - (col % 4); i++; }
+    else if (c === 9) { col += 4 - ((base + col) % 4); i++; }
     else break;
   }
   return { col, i };
 }
 
-// Index of the first non-space/tab character (or s.length).
+// Index of the first character that is not a space or tab (or s.length).
 function firstNonSpace(s) {
   let i = 0;
   while (i < s.length && (s.charCodeAt(i) === 32 || s.charCodeAt(i) === 9)) i++;
@@ -171,14 +180,15 @@ function isBlank(s) {
 }
 
 // Remove `cols` columns of leading whitespace from `s` (tab-aware; a tab
-// that straddles the cut becomes spaces).
-function stripIndent(s, cols) {
+// that straddles the cut turns into spaces). `base` is the absolute column
+// where `s` starts.
+function stripIndent(s, cols, base = 0) {
   let col = 0, i = 0;
   while (i < s.length && col < cols) {
     const c = s.charCodeAt(i);
     if (c === 32) { col++; i++; }
     else if (c === 9) {
-      const w = 4 - (col % 4);
+      const w = 4 - ((base + col) % 4);
       if (col + w > cols) return ' '.repeat(col + w - cols) + s.slice(i + 1);
       col += w; i++;
     } else break;
@@ -186,23 +196,23 @@ function stripIndent(s, cols) {
   return s.slice(i);
 }
 
-// Normalize a link label: collapse whitespace runs to one space, lowercase.
+// Normalize a link label: collapse whitespace runs to a single space,
+// trim, lowercase (with sharp S folding to "ss").
 function normalizeLabel(label) {
-  // Unicode case folding: sharp S (both cases) folds to "ss".
   return label.replace(/\s+/g, ' ').trim().toLowerCase().replace(/ß/g, 'ss');
 }
 
 // Advance `cols` columns from string index `from` in `line` (tab-aware).
-function advanceCols(line, from, cols) {
-  // Returns {i, pad}: index after consuming `cols` columns, plus the
-  // number of leftover columns when a tab straddles the cut (those
-  // columns become spaces, not lost).
+// Returns {i, pad}: the index after consuming `cols` columns, plus the
+// leftover columns when a tab straddles the cut (those columns become
+// spaces, not lost). `base` is the absolute column of line[from].
+function advanceCols(line, from, cols, base = 0) {
   let col = 0, i = from, pad = 0;
   while (i < line.length && col < cols) {
     const c = line.charCodeAt(i);
     if (c === 32) { col++; i++; }
     else if (c === 9) {
-      const w = 4 - (col % 4);
+      const w = 4 - ((base + col) % 4);
       if (col + w > cols) { pad = col + w - cols; i++; break; }
       col += w; i++;
     }
@@ -212,13 +222,13 @@ function advanceCols(line, from, cols) {
 }
 
 // ---------------------------------------------------------------------------
-// Part 2 — block parsing
+// Part 2 — block-level helpers
 // ---------------------------------------------------------------------------
 
 const BLOCK_TAGS = new Set(('address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link main menu menuitem nav noframes ol optgroup option p param search section summary table tbody td tfoot th thead title tr track ul').split(' '));
 
-// Split a table row on unescaped pipes. Leading/trailing empty cells from
-// outer pipes are dropped. Returns the raw cell strings (untrimmed).
+// Split a table row on unescaped pipes. The empty cells implied by outer
+// pipes are dropped. Returns the raw (untrimmed) cell strings.
 function splitRow(line) {
   const cells = [];
   let cur = '';
@@ -235,8 +245,8 @@ function splitRow(line) {
 }
 
 // Is this line a GFM table delimiter row? Returns the alignment array
-// ('left'|'right'|'center'|null) or null. Delimiter cells are 1+ dashes with
-// optional leading/trailing colon.
+// ('left' | 'right' | 'center' | null per column) or null. A delimiter
+// cell is one or more dashes with an optional leading/trailing colon.
 function parseDelimiterRow(text) {
   const t = text.trim();
   if (!t) return null;
@@ -251,31 +261,42 @@ function parseDelimiterRow(text) {
   return aligns;
 }
 
-// Match a blockquote marker at line[pos..]: up to 3 columns of indent, '>',
-// one optional space/tab. Returns the index just past the marker, or -1.
-function matchQuote(line, pos) {
-  let col = 0, i = pos;
+// Match a blockquote marker at line[pos..]: up to 3 columns of indent,
+// '>', then one optional space. Returns {i, col, padCols} — the index just
+// past the marker, the absolute column where the virtual text starts, and
+// the leftover columns when a tab straddles the optional space — or null.
+// `base` is the absolute column of line[pos]. A tab after '>' is consumed
+// as ONE column (the optional space); its remaining columns become pad
+// spaces in the virtual text.
+function matchQuote(line, pos, base = 0) {
+  let col = base, i = pos;
   while (i < line.length) {
     const c = line.charCodeAt(i);
     if (c === 32) { col++; i++; }
     else if (c === 9) { col += 4 - (col % 4); i++; }
     else break;
-    if (col > 3) return -1;
+    if (col - base > 3) return null;
   }
-  if (col > 3) return -1;
-  if (line.charCodeAt(i) !== 62) return -1; // '>'
-  i++;
-  if (i < line.length && (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9)) i++;
-  return i;
+  if (col - base > 3) return null;
+  if (line.charCodeAt(i) !== 62) return null; // '>'
+  i++; col++;
+  let padCols = 0;
+  if (i < line.length && line.charCodeAt(i) === 32) { i++; col++; }
+  else if (i < line.length && line.charCodeAt(i) === 9) {
+    const w = 4 - (col % 4);
+    i++; col++;
+    padCols = w - 1;
+  }
+  return { i, col, padCols };
 }
 
-// Try to parse a link reference definition starting at lines[li], column col.
-// The definition may span lines (destination / title on following lines).
-// Returns {dest, title, endLine, endCol} or null.
+// Try to parse a link reference definition starting at lines[li], column
+// col. The definition may span lines (destination / title on following
+// lines). Returns {dest, title, endLine, endCol, label} or null.
 function tryParseRefDef(lines, li, col) {
   const line = lines[li];
   if (line.charCodeAt(col) !== 91) return null; // '['
-  // Scan the label; it may span lines (a newline in the label
+  // Scan the label; it may span lines (a newline inside the label
   // normalizes to a space when matched).
   let j = col + 1, label = '';
   let labelLine = li;
@@ -284,8 +305,8 @@ function tryParseRefDef(lines, li, col) {
     const curLine = lines[labelLine];
     while (j < curLine.length) {
       const c = curLine.charCodeAt(j);
-      // Backslash escapes are kept verbatim in the label (matching the
-      // inline link label rule): `bar\\` stays `bar\\`.
+      // Backslash escapes stay verbatim in the label (the inline link
+      // label rule): `bar\\` stays `bar\\`.
       if (c === 92 && j + 1 < curLine.length && isPunct(curLine.charCodeAt(j + 1))) { label += curLine[j] + curLine[j + 1]; j += 2; continue; }
       if (c === 91 || c === 93) break;
       label += curLine[j]; j++;
@@ -394,9 +415,11 @@ function tryParseRefDef(lines, li, col) {
 // Does the text (after container markers) start a new block? Used for the
 // lazy-continuation decision and for table body termination. Returns the
 // block kind or null. Indented code and HTML type 7 cannot interrupt a
-// paragraph, so they return null here.
-function blockStartKind(text, paraInterrupt) {
-  const { col, i } = indentCols(text);
+// paragraph, so they return null here. `base` is the absolute column where
+// `text` starts; `parentIsItem` is whether the paragraph's parent is a
+// list item (then any starting number may interrupt).
+function blockStartKind(text, paraInterrupt, base = 0, parentIsItem = false) {
+  const { col, i } = indentCols(text, base);
   if (i >= text.length) return null;
   const rest = text.slice(i);
   if (col >= 4) return null;
@@ -438,8 +461,12 @@ function blockStartKind(text, paraInterrupt) {
   if (isDigit(c0)) {
     let n = 0; while (n < rest.length && isDigit(rest.charCodeAt(n))) n++;
     if (n >= 1 && n <= 9 && (rest.charCodeAt(n) === 46 || rest.charCodeAt(n) === 41) && (n + 1 === rest.length || rest.charCodeAt(n + 1) === 32 || rest.charCodeAt(n + 1) === 9)) {
-      // An ordered list can interrupt a paragraph only if it starts with 1.
-      if (paraInterrupt && parseInt(rest.slice(0, n), 10) !== 1) return null;
+      // An ordered list can interrupt a paragraph only if it starts with 1
+      // — UNLESS the paragraph's parent is a list item, in which case any
+      // starting number can start a nested list inside the item (`- [x]
+      // Foo` + `  3. bar` starts <ol start="3">). At the top level or
+      // inside a quote, `Foo\n3. bar` stays one paragraph.
+      if (paraInterrupt && parseInt(rest.slice(0, n), 10) !== 1 && !parentIsItem) return null;
       // An empty ordered item cannot interrupt a paragraph either.
       if (paraInterrupt) {
         let q = n + 1;
@@ -457,8 +484,12 @@ function blockStartKind(text, paraInterrupt) {
     const m = lower.match(/^<\/?([a-z][a-z0-9-]*)(\s|\/?>|$)/);
     if (m) {
       const tag = m[1];
-      if (tag === 'script' || tag === 'pre' || tag === 'style' || tag === 'textarea') return 'html';
-      if (BLOCK_TAGS.has(tag)) return 'html';
+      // Type 1 (script/pre/style/textarea) starts only with the OPEN tag;
+      // a closing tag (</pre> etc.) is type 7 at most and cannot interrupt
+      // a paragraph (`</pre>` stays a lazy paragraph continuation).
+      if (tag === 'script' || tag === 'pre' || tag === 'style' || tag === 'textarea') {
+        if (rest.charCodeAt(1) !== 47) return 'html';
+      } else if (BLOCK_TAGS.has(tag)) return 'html';
     }
     return null;
   }
@@ -536,10 +567,16 @@ class BlockParser {
       else if (b.t === 'html') this.finishHtml(b);
     }
   }
+
   // Finish a paragraph; a defs-only paragraph (no text lines) is removed
   // from its parent instead of rendering.
   closeParaNode(b) {
+    const keepOne = !!b._keepTrailing;
     while (b.lines.length && b.lines[b.lines.length - 1] === '') b.lines.pop();
+    // A paragraph closed while sealed (flagged by the blank-line or
+    // block-start site) keeps one trailing empty line, so its text ends
+    // with a newline.
+    if (keepOne && b.lines.length > 0) b.lines.push('');
     if (b.lines.length === 0) {
       const parent = this.tip();
       const idx = parent.children.indexOf(b);
@@ -547,7 +584,7 @@ class BlockParser {
       return;
     }
     b.text = b.lines.join('\n');
-    delete b.lines; delete b.onlyDefs;
+    delete b.lines; delete b.onlyDefs; delete b._keepTrailing;
   }
   finishPara(b) {
     this.closeParaNode(b);
@@ -624,27 +661,61 @@ class BlockParser {
   // indent when the remaining indent covers it, then strip one 4-column
   // code-indent when the remainder is >= 4 and the line is lazy or the
   // innermost matched container is a list item.
-  addParaLine(rest, cUnmatched, lazy, innermostIsItem) {
+  //
+  // Seal rule: a line that loses 4 columns to the code-indent strip seals
+  // the paragraph (`_sealed`); a line that does not lose 4 columns clears
+  // it. `_sealedByMatch` records whether the seal came from a matching
+  // (non-lazy) line. The seal itself never splits the paragraph — the
+  // callers insert a single empty line when the next line arrives.
+  addParaLine(rest, cUnmatched, lazy, innermostIsItem, base = 0) {
     let s = rest;
-    const { col: r0 } = indentCols(s);
-    if (cUnmatched > 0 && r0 >= cUnmatched) s = stripIndent(s, cUnmatched);
-    const { col: r1 } = indentCols(s);
-    if ((lazy || innermostIsItem) && r1 >= 4) s = stripIndent(s, 4);
+    let baseCol = base;
+    const { col: r0 } = indentCols(s, baseCol);
+    if (cUnmatched > 0 && r0 >= cUnmatched) { s = stripIndent(s, cUnmatched, baseCol); baseCol += cUnmatched; }
+    const { col: r1 } = indentCols(s, baseCol);
+    let stripped4 = false;
+    const p = this.tip();
+    // No 4-column strip in a post-list paragraph (see the _postList note
+    // at paragraph creation): its lines keep their indent and it never
+    // seals.
+    if ((lazy || innermostIsItem) && !p._postList && r1 >= 4) { s = stripIndent(s, 4, baseCol); stripped4 = true; }
     // Lazy setext-lookalike line inside a quote, after a lazy line: marked
     // indents it to exactly 4 spaces (verified on `> foo\nbar\n===` etc.).
-    const p = this.tip();
     if (lazy && p._hasLazy && /^ {0,3}(=+|-+)[ \t]*$/.test(s)) {
       let inQuote = false;
       for (let k = 0; k < this.stack.length; k++) if (this.stack[k].t === 'quote') { inQuote = true; break; }
       if (inQuote) s = '    ' + s.replace(/^[ \t]+/, '');
     }
     p.lines.push(s);
-    if (lazy) p._hasLazy = true;
-    // A non-lazy continuation line (matching the containers) anchors the
-    // paragraph: a later indent-0 line then closes it instead of lazily
-    // continuing it (verified: multi-line para + indent-0 line closes
-    // the lists, single-line or lazy-continued para stays lazy).
-    else if (p.lines.length > 1) p._hasMatchingCont = true;
+    if (lazy) {
+      p._hasLazy = true;
+      // A lazy line's seal never counts as "sealed by a match".
+      p._sealed = stripped4;
+      p._sealedByMatch = false;
+      // The last lazy line's remaining indent (after the container walk
+      // and the unmatched-item strip, before any 4-column strip): a
+      // paragraph whose last lazy line kept >= 2 leading spaces is closed
+      // by a later lazy line that fails the outermost item (verified on
+      // the depth-3 indent matrix: a lazy rest-2 line arms the close,
+      // a lazy rest-0/1 line does not; a matching line resets this).
+      p._lastLazyRest = r1;
+    } else {
+      p._sealed = stripped4;
+      // A matching line that loses 4 columns seals the paragraph BY A
+      // MATCH: a later lazy line then closes the paragraph and its item.
+      p._sealedByMatch = stripped4;
+      // The last matching line's remaining indent (after the container
+      // walk, before any 4-column strip): a paragraph whose last matching
+      // line kept >= 2 leading spaces is closed by a later lazy line
+      // that fails the outermost item (see the §10 rule below).
+      p._lastMatchRest = r1;
+      p._lastLazyRest = -1;
+      // A non-lazy continuation line (matching the containers) anchors the
+      // paragraph: a later indent-0 line then closes it instead of lazily
+      // continuing it (verified: multi-line para + indent-0 line closes
+      // the lists, single-line or lazy-continued para stays lazy).
+      if (p.lines.length > 1) p._hasMatchingCont = true;
+    }
   }
 
   parse() {
@@ -652,26 +723,40 @@ class BlockParser {
     while (this.i < lines.length) {
       const line = lines[this.i];
       // ---- container matching ----
+      // Walk state: `off` = string index in the line, `col` = absolute
+      // column of the virtual text start, `padCols` = leftover columns
+      // from a tab straddled by a cut (virtual spaces before line[off]).
+      // The virtual text is ' '.repeat(padCols) + line.slice(off), and
+      // a tab's width is always relative to its absolute column
+      // (CommonMark partially-consumed-tab rule, verified vs marked).
       let off = 0, matched = 0, failedAt = -1;
       let matchedItemCols = 0; // item indent stripped by the walk
       let hasQuote = false; // the line carried a `>` marker
-      let pad = ''; // spaces from tabs straddled by an item-indent cut
+      let col = 0; // absolute column of the virtual text start
+      let padCols = 0; // virtual spaces before line[off]
       for (let k = 1; k < this.stack.length; k++) {
         const node = this.stack[k];
         if (node.t === 'quote') {
-          const r = matchQuote(line, off);
-          if (r === -1) { failedAt = k; break; }
-          off = r; matched = k; hasQuote = true;
+          const r = matchQuote(line, off, col + padCols);
+          if (r === null) { failedAt = k; break; }
+          off = r.i; col = r.col; padCols = r.padCols; matched = k; hasQuote = true;
         } else if (node.t === 'list') {
           matched = k;
         } else if (node.t === 'item') {
           if (isBlank(line.slice(off))) { matched = k; }
           else {
-            const { col } = indentCols(line.slice(off));
-            if (col >= node.contentIndent) {
-              const adv = advanceCols(line, off, node.contentIndent);
-              off = adv.i;
-              if (adv.pad > 0) pad += ' '.repeat(adv.pad);
+            const ind = indentCols(line.slice(off), col + padCols).col;
+            if (padCols + ind >= node.contentIndent) {
+              if (padCols >= node.contentIndent) {
+                padCols -= node.contentIndent;
+                col += node.contentIndent;
+              } else {
+                const need = node.contentIndent - padCols;
+                const adv = advanceCols(line, off, need, col + padCols);
+                off = adv.i;
+                col = col + padCols + need;
+                padCols = adv.pad;
+              }
               matchedItemCols += node.contentIndent;
               matched = k;
             } else { failedAt = k; break; }
@@ -679,7 +764,8 @@ class BlockParser {
         } else break; // leaf
       }
       const allMatched = failedAt === -1;
-      const rest = pad + line.slice(off);
+      const rest = ' '.repeat(padCols) + line.slice(off);
+      const restCol = col;
       const blank = isBlank(rest);
 
       if (blank) {
@@ -690,15 +776,15 @@ class BlockParser {
         // paragraph keeps the spaces as its last line.
         if (hasQuote && rest.length > 0 && t.t === 'para') {
           const innermostIsItem = this.stack.length > 1 && this.stack[this.stack.length - 2].t === 'item';
-          this.addParaLine(rest, 0, false, innermostIsItem);
+          this.addParaLine(rest, 0, false, innermostIsItem, restCol);
           this.i++; continue;
         }
         // A blank line inside a fenced code block keeps its whitespace
         // (it is code content, minus the fence indent); inside an
         // indented block it keeps the line minus the 4-column indent.
         if (t.t === 'code') {
-          if (t.fenced) t.lines.push(t.fenceIndent > 0 ? stripIndent(rest, t.fenceIndent) : rest);
-          else t.lines.push(stripIndent(rest, 4));
+          if (t.fenced) t.lines.push(t.fenceIndent > 0 ? stripIndent(rest, t.fenceIndent, restCol) : rest);
+          else t.lines.push(stripIndent(rest, 4, restCol));
           this.i++; continue;
         }
         // HTML types 1-5 end at a marker, not a blank line: the blank
@@ -710,7 +796,24 @@ class BlockParser {
           const b = this.stack.pop(); this.finishHtml(b);
         }
         if (this.tip().t === 'table') this.stack.pop();
-        if (this.tip().t === 'para') this.closePara();
+        // A blank line closes the paragraph but its parent stays open, so
+        // a sealed paragraph keeps one trailing empty line (its text ends
+        // with a newline, e.g. `<p>foo\nbar\nbaz\n</p>` in a loose list).
+        // The trailing line is kept only if the list turns out LOOSE
+        // (another item follows); when the list ends tight (a top-level
+        // paragraph follows) it is dropped at render time. The pending
+        // flag records that this trailing line came from a blank line.
+        if (this.tip().t === 'para') {
+          const pb = this.tip();
+          if (pb._sealed && pb.lines.length > 0) { pb.lines.push(''); pb._keepTrailing = true; pb._trailingPending = true; }
+          this.closePara();
+        }
+        // An empty list item is closed by a blank line: it can gain no
+        // content after one (`-\n\n  foo` leaves `  foo` a top-level
+        // paragraph, not the item's content). Only an item with no blocks
+        // yet closes; a non-empty item keeps later indented content
+        // (e.g. `- foo\n\n  bar` stays inside the item).
+        if (this.tip().t === 'item' && this.tip().children.length === 0) this.stack.pop();
         // A blank line inside a list/item is pending looseness: the next
         // item or block in that context makes the list loose. (The flag
         // is consumed once, by loosenCheck, so one blank cannot loosen
@@ -735,13 +838,13 @@ class BlockParser {
           const b = this.stack.pop(); this.finishCode(b);
         } else {
           // Content lines lose up to the opening fence's indent.
-          t.lines.push(t.fenceIndent > 0 ? stripIndent(rest, t.fenceIndent) : rest);
+          t.lines.push(t.fenceIndent > 0 ? stripIndent(rest, t.fenceIndent, restCol) : rest);
         }
         this.i++; continue;
       }
       if (allMatched && t.t === 'code' && !t.fenced) {
-        const { col } = indentCols(rest);
-        if (col >= 4) { t.lines.push(stripIndent(rest, 4)); this.i++; continue; }
+        const { col } = indentCols(rest, restCol);
+        if (col >= 4) { t.lines.push(stripIndent(rest, 4, restCol)); this.i++; continue; }
         const b = this.stack.pop(); this.finishCode(b);
         // fall through: reprocess the line at the new tip
       } else if (allMatched && t.t === 'html') {
@@ -751,7 +854,7 @@ class BlockParser {
         }
         this.i++; continue;
       } else if (allMatched && t.t === 'table') {
-        if (blockStartKind(rest) !== null) {
+        if (blockStartKind(rest, false, restCol) !== null) {
           this.stack.pop();
           // fall through: reprocess the line at the new tip
         } else {
@@ -788,7 +891,7 @@ class BlockParser {
         }
         // Table delimiter row: the paragraph's last line is the header.
         // The delimiter line must be indented by at most 3 columns.
-        if (allMatched && p.lines.length > 0 && indentCols(rest).col <= 3) {
+        if (allMatched && p.lines.length > 0 && indentCols(rest, restCol).col <= 3) {
           const aligns = parseDelimiterRow(rest);
           if (aligns) {
             const headerCells = splitRow(p.lines[p.lines.length - 1].trim());
@@ -811,9 +914,9 @@ class BlockParser {
         }
         // Link reference definitions, while the paragraph is defs-only.
         if (p.onlyDefs) {
-          const { col: c0, i: ci } = indentCols(rest);
+          const { col: c0, i: ci } = indentCols(rest, restCol);
           if (c0 <= 3) {
-            const d = tryParseRefDef(lines, this.i, off + ci);
+            const d = tryParseRefDef(lines, this.i, off + ci - padCols);
             if (d) {
               const key = normalizeLabel(d.label);
               if (!this.refs.has(key)) this.refs.set(key, { dest: d.dest, title: d.title });
@@ -833,13 +936,42 @@ class BlockParser {
         // only when the line matches the paragraph's containers; a lazy
         // line (not matching) always closes the paragraph, since it is at
         // an outer level (e.g. the next item of the enclosing list).
-        if (blockStartKind(rest, allMatched) !== null) {
+        // Exception: when the paragraph's parent is a list item, any
+        // starting number can interrupt (nested list inside the item).
+        const parentIsItem = this.stack.length > 1 && this.stack[this.stack.length - 2].t === 'item';
+        if (blockStartKind(rest, allMatched, restCol, parentIsItem) !== null) {
+          // A new block starting inside the paragraph's containers closes
+          // it but the parent stays open, so a sealed paragraph keeps one
+          // trailing empty line (e.g. `foo\nbar\n<ul>`). A lazy line (not
+          // matching) starts its block at an outer level, closing the
+          // parent too, so no trailing line there.
+          if (allMatched && p._sealed && p.lines.length > 0) { p.lines.push(''); p._keepTrailing = true; }
           this.closePara();
           continue; // reprocess the line (do not advance i)
         }
         if (allMatched) {
           const innermostIsItem = this.stack.length > 1 && this.stack[this.stack.length - 2].t === 'item';
-          this.addParaLine(rest, 0, false, innermostIsItem);
+          // Match-seal split: a paragraph sealed by a MATCHING line that
+          // lost 4 columns is ENDED by the next matching line unless that
+          // line also loses 4 columns (two strip lines stay joined).
+          // E.g. `  - A.` + `        X.` + `    C` renders `A.\nX.\n\nC`
+          // (two paragraphs in the tight item), while `        Y.` after
+          // `        X.` stays joined. The blank line comes from the
+          // two-paragraph separator; no trailing line is pushed.
+          if (p._sealed && p._sealedByMatch && !(innermostIsItem && indentCols(rest, restCol).col >= 4)) {
+            this.closePara();
+            continue; // reprocess the line (do not advance i)
+          }
+          // Seal rule: a sealed paragraph is NOT split. The matching line
+          // inserts ONE empty line into the paragraph's lines (rendering
+          // as a blank line inside the paragraph, e.g. `<p>foo\nbar\n\n
+          // baz</p>` in a loose list) and the paragraph continues; the
+          // seal is cleared by addParaLine's non-lazy branch. The insert
+          // fires ONLY when the seal came from a LAZY line: a seal set by
+          // a matching line does not insert (two matching strip lines
+          // stay joined).
+          if (p._sealed && !p._sealedByMatch) p.lines.push('');
+          this.addParaLine(rest, 0, false, innermostIsItem, restCol);
           this.i++; continue;
         }
         // Lazy continuation (blockStartKind is null here, checked above).
@@ -854,17 +986,126 @@ class BlockParser {
           this.closePara();
           continue; // reprocess the line at the outer level
         }
-        const cTotal = this.totalItemIndent();
-        const cUnmatched = cTotal - matchedItemCols;
+        // Nested matching-continuation close: a paragraph in a nested item
+        // (depth >= 2), anchored by a matching continuation line, is
+        // closed by a lazy line that fails the OUTERMOST item (indent <
+        // the outermost item's content indent) when EITHER the inner
+        // item's content is indented >= 4 columns beyond the outer
+        // item's (nest gap >= 4, in ABSOLUTE columns) OR the paragraph's
+        // last matching line kept >= 2 leading spaces (its remaining
+        // indent after the container walk is >= 2, e.g. `- A.` + `  * B.`
+        // + `      C.` + `D` closes although the gap is only 2 — while
+        // `    C.` (rest 0) and a last line that reset the rest to 0 stay
+        // lazy). The same close fires when the paragraph's last line is a
+        // LAZY line that kept >= 2 leading spaces (depth-3 indent matrix:
+        // a lazy rest-2 line arms it, rest-0/1 does not; at depth 3 the
+        // gap is >= 4 whenever the lazy arm can fire). The indent
+        // threshold is the outermost item's indent, not 2: with outer
+        // `  -` (CI 4) a lazy line at indent 2 or 3 closes, at indent 4
+        // it stays lazy. No seal is needed.
+        if ((tipPara._hasMatchingCont || (tipPara._lastLazyRest || 0) >= 2) && itemDepth >= 2) {
+          let outerCI = -1;
+          for (let k = 1; k < this.stack.length; k++) {
+            if (this.stack[k].t === 'item') { outerCI = this.stack[k].contentIndent; break; }
+          }
+          // Absolute content column of the innermost item = sum of all
+          // item contentIndents (totalItemIndent); the outermost item's
+          // absolute column is its own contentIndent.
+          // Two arms, both gap-sensitive in different ways:
+          // - match arm: a matching continuation anchors the paragraph;
+          //   it closes when the nest gap is >= 4, or (gap-free) when
+          //   the last matching line kept >= 2 leading spaces.
+          // - lazy arm: the paragraph's last line is a lazy line that
+          //   kept >= 2 leading spaces; it closes ONLY at depth >= 3
+          //   (at depth 2 a lazy rest-2 line does NOT close — verified
+          //   on doc-11's case at gap 3 and doc-08's case at gap 4;
+          //   at depth 3 the gap is >= 5 whenever the arm can fire).
+          const gap = this.totalItemIndent() - outerCI;
+          // The match arm fires only while the paragraph's LAST line is
+          // a matching line: any lazy line resets it (verified: a lazy
+          // rest-0/1/2 line after a matching continuation keeps the
+          // paragraph lazy at gap 4 and gap 6 alike). `_lastLazyRest` is
+          // -1 after a matching line, >= 0 after a lazy one.
+          const matchArm = tipPara._hasMatchingCont && (tipPara._lastLazyRest ?? -1) < 0 && (gap >= 4 || (tipPara._lastMatchRest || 0) >= 2);
+          const lazyArm = (tipPara._lastLazyRest || 0) >= 2 && itemDepth >= 3;
+          if (outerCI >= 0 && indentCols(line).col < outerCI && (matchArm || lazyArm)) {
+            this.closePara();
+            continue; // reprocess the line at the outer level
+          }
+        }
         const innermostIsItem = this.stack.length > 1 && this.stack[this.stack.length - 2].t === 'item';
-        this.addParaLine(rest, cUnmatched, true, innermostIsItem);
+        // Deep-nest lazy close: at depth >= 3, when the inner items are
+        // indented >= 6 columns beyond the outermost item (nest gap >= 6),
+        // a lazy line that reaches neither the outermost item's content
+        // indent nor 4 columns closes the paragraph (the line is
+        // reprocessed at the outer level). E.g. `  - A.` + `    - B.` +
+        // `      - C.` + `  D` closes (gap 6, indent 2 < 4), but a gap-5
+        // nest and a line with indent >= min(outerCI, 4) stay lazy. This
+        // holds with or without a matching continuation line.
+        if (itemDepth >= 3 && innermostIsItem) {
+          let outerCI = -1;
+          for (let k = 1; k < this.stack.length; k++) {
+            if (this.stack[k].t === 'item') { outerCI = this.stack[k].contentIndent; break; }
+          }
+          if (outerCI >= 0 && this.totalItemIndent() - outerCI >= 6 && indentCols(line).col < Math.min(outerCI, 4)) {
+            this.closePara();
+            continue; // reprocess the line at the outer level
+          }
+        }
+        // Lazy-line dedent: marked strips the content indent of the
+        // FIRST (outermost) unmatched item whose indent the line's
+        // remaining indent covers; if no unmatched item's indent is
+        // covered, nothing is stripped. The strip is all-or-nothing per
+        // item and the outermost covered item wins. Verified on 100+
+        // probes: (O=4,R=3,L=2) strips 0, (O=4,R=2,L=2) strips 2,
+        // (O=6,R=5,L=5) strips 5, (mid=3,inner=2,L=3) strips 3,
+        // (mid=2,inner=3,L=3) strips 2.
+        let cUnmatched = 0;
+        {
+          const r0 = indentCols(rest, restCol).col;
+          for (let k = failedAt; k < this.stack.length; k++) {
+            const node = this.stack[k];
+            if (node.t === 'item' && node.contentIndent <= r0) { cUnmatched = node.contentIndent; break; }
+          }
+        }
+        // Seal close rule: a sealed paragraph in a list item is closed by
+        // any lazy line — the line is reprocessed at the outer level,
+        // closing the item — when EITHER the seal came from a MATCHING
+        // line (any depth: `- foo` + `      bar` + `baz` closes) OR the
+        // paragraph sits in a NESTED item (depth >= 2) AND the lazy line
+        // fails the OUTERMOST item (it matched no item: matchedItemCols
+        // is 0). A lazy seal in a nested item does NOT close when the line
+        // matches the outer item — the line then splits the paragraph
+        // inside the item (seal-insert below) instead. A seal set by a
+        // lazy line in a top-level item does NOT close (the lazy line
+        // stays, with one empty line inserted). Quotes never close this way.
+        if (p._sealed && innermostIsItem && (p._sealedByMatch || (itemDepth >= 2 && matchedItemCols === 0))) {
+          this.closePara();
+          continue; // reprocess the line at the outer level
+        }
+        // Seal rule: a sealed paragraph is NOT split by a lazy line that
+        // does not lose 4 columns to the code-indent strip. The lazy line
+        // inserts ONE empty line into the paragraph's lines (rendering as
+        // a blank line inside the paragraph) and is added to the SAME
+        // paragraph with its leading whitespace kept; the seal is cleared
+        // (addParaLine sets _sealed = stripped4, false here). A lazy line
+        // that loses 4 columns just continues the paragraph (seal stays).
+        let r1 = 0;
+        if (p._sealed) {
+          let s0 = rest, b0 = restCol;
+          const r0 = indentCols(s0, b0).col;
+          if (cUnmatched > 0 && r0 >= cUnmatched) { s0 = stripIndent(s0, cUnmatched, b0); b0 += cUnmatched; }
+          r1 = indentCols(s0, b0).col;
+        }
+        if (p._sealed && r1 < 4) p.lines.push('');
+        this.addParaLine(rest, cUnmatched, true, innermostIsItem, restCol);
         this.i++; continue;
       }
 
       // ---- not a paragraph tip: close unmatched containers, then start ----
       if (!allMatched) { this.closeTo(matched); continue; }
 
-      const { col: ind, i: ci } = indentCols(rest);
+      const { col: ind, i: ci } = indentCols(rest, restCol);
       const content = rest.slice(ci);
       // A list can only contain list items. If the tip is a list and this
       // line does not start an item of this list, close the list and
@@ -930,7 +1171,7 @@ class BlockParser {
       // Thematic break
       if (ind <= 3 && isThematicBreak(content)) { this.tip().children.push({ t: 'hr', children: [] }); this.i++; continue; }
       // Blockquote
-      if (matchQuote(rest, 0) !== -1) {
+      if (matchQuote(rest, 0, restCol) !== null) {
         const quote = { t: 'quote', children: [] };
         this.openBlock(quote);
         continue; // reprocess the line inside the quote (do not advance i)
@@ -938,20 +1179,34 @@ class BlockParser {
       // List item
       const ls = matchListStart(content, ind);
       if (ls) {
-        this.startListItem(ls, off, ci);
+        this.startListItem(ls, off, ci, padCols, restCol);
         continue; // startListItem advances i or rewrites the line
       }
       // Indented code
       if (ind >= 4) {
-        const code = { t: 'code', fenced: false, lines: [stripIndent(rest, 4)], children: [] };
+        const code = { t: 'code', fenced: false, lines: [stripIndent(rest, 4, restCol)], children: [] };
         this.openBlock(code);
         this.i++; continue;
       }
       // Paragraph (or link reference definitions at its start).
       const para = { t: 'para', lines: [], onlyDefs: true, children: [] };
+      // Post-list paragraph: once a sub-list has appeared in the
+      // enclosing list item, later paragraphs in that item are "loose"
+      // — their continuation lines keep their indent (no 4-column strip,
+      // no seal) and they render wrapped in <p> even in a tight list.
+      // E.g. `- Dog.` + `  - Import.` + `  ## Head` + `  Badge.` +
+      // `      More.` keeps `    More.` (no strip) and wraps Badge in
+      // <p>, while the same shape without the sub-list strips to `More.`
+      // and renders bare. A paragraph before any sub-list is unaffected.
+      for (let k = this.stack.length - 1; k >= 1; k--) {
+        if (this.stack[k].t === 'item') {
+          if (this.stack[k].children.some(ch => ch.t === 'list')) para._postList = true;
+          break;
+        }
+      }
       this.openBlock(para);
       if (ind <= 3) {
-        const d = tryParseRefDef(lines, this.i, off + ci);
+        const d = tryParseRefDef(lines, this.i, off + ci - padCols);
         if (d) {
           const key = normalizeLabel(d.label);
           if (!this.refs.has(key)) this.refs.set(key, { dest: d.dest, title: d.title });
@@ -972,7 +1227,7 @@ class BlockParser {
       }
       para.onlyDefs = false;
       const innermostIsItem = this.stack.length > 1 && this.stack[this.stack.length - 2].t === 'item';
-      this.addParaLine(rest, 0, false, innermostIsItem);
+      this.addParaLine(rest, 0, false, innermostIsItem, restCol);
       this.i++;
     }
     this.closeTo(0);
@@ -984,7 +1239,7 @@ class BlockParser {
   // Non-empty items: rewrite the line so the remainder is reprocessed inside
   // the new item (prefix preserved, content indent inserted). Empty items:
   // push the item and advance.
-  startListItem(ls, off, ci) {
+  startListItem(ls, off, ci, padCols = 0, restCol = 0) {
     // A blank between items of this list loosens it. Capture the flag
     // now: loosenCheck() below clears pending flags (a blank is
     // consumed once), and the previous item may already be popped, so
@@ -993,21 +1248,38 @@ class BlockParser {
     const listPending = (tip0.t === 'list' && tip0.ordered === ls.ordered && tip0.delim === ls.marker) ? tip0._blankPending : false;
     this.loosenCheck();
     const line = this.lines[this.i];
-    let q = off + ci + ls.markerLen;
-    const baseIndent = indentCols(line.slice(off)).col;
+    // `ci` counts pad spaces too; the marker's index in the original
+    // line is off + ci - padCols. The absolute column of line[off] is
+    // restCol + padCols; tab widths in the whitespace run are relative
+    // to it.
+    const markerIdx = off + ci - padCols;
+    let q = markerIdx + ls.markerLen;
+    const absOff = restCol + padCols;
+    const baseIndent = indentCols(line.slice(off), absOff).col;
     let col = baseIndent + ls.markerLen;
+    let colAbs = absOff + col;
     let spaces = 0;
     while (q < line.length && (line.charCodeAt(q) === 32 || line.charCodeAt(q) === 9)) {
-      if (line.charCodeAt(q) === 32) { spaces++; col++; q++; }
-      else { const w = 4 - (col % 4); spaces += w; col += w; q++; }
+      if (line.charCodeAt(q) === 32) { spaces++; col++; colAbs++; q++; }
+      else { const w = 4 - (colAbs % 4); spaces += w; col += w; colAbs += w; q++; }
     }
     const isEmpty = q >= line.length;
-    // Content indent is the absolute column where the content starts: the
-    // leading indent + marker + spaces (1-4 spaces), or leading indent +
-    // marker + 1 when there are 5+ spaces or the item is empty.
-    const contentIndent = isEmpty
-      ? baseIndent + ls.markerLen + 1
-      : (spaces >= 5 ? baseIndent + ls.markerLen + 1 : col);
+    // Content indent is the absolute column where the content starts,
+    // relative to the virtual text start (restCol): the leading indent
+    // + marker + spaces (1-4 spaces), or leading indent + marker + 1
+    // when there are 5+ spaces or the item is empty. It MUST be
+    // computed from absolute columns (colAbs / absOff), not from `col`:
+    // when a tab straddles the outer item's strip, the walk leaves a
+    // pad (padCols) and `col` is measured from the tab's end, so it
+    // understates the content indent by the pad — the walk then
+    // under-strips later lines and the pad leaks into the content as
+    // leading spaces (e.g. `+ Extends.` + `\t1. Quote...` rendered
+    // `  Quote...` instead of `Quote...`). With no pad the two agree
+    // (absOff == restCol), so non-tab cases are unaffected.
+    const contentColAbs = (isEmpty || spaces >= 5)
+      ? absOff + baseIndent + ls.markerLen + 1
+      : colAbs;
+    const contentIndent = contentColAbs - restCol;
     const t = this.tip();
     let list = null;
     if (t.t === 'list' && t.ordered === ls.ordered && t.delim === ls.marker) list = t;
@@ -1026,8 +1298,20 @@ class BlockParser {
       this.i++;
       return;
     }
-    // Rewrite the line: outer prefix + contentIndent spaces + remainder.
-    this.lines[this.i] = line.slice(0, off) + ' '.repeat(contentIndent) + line.slice(q);
+    // Rewrite the line: outer prefix + spaces to the content's column +
+    // remainder. The space count is `col` (the column where the content
+    // starts), NOT contentIndent: when the whitespace run is 5+ columns
+    // the extra columns are real indent that an indented code block (or
+    // a lazy continuation) can still see — collapsing them to
+    // contentIndent loses them (e.g. `-\t\tfoo` must keep 6 columns so
+    // the code indent leaves "  foo"). Exception: when the innermost
+    // open container is a blockquote that did NOT consume an optional
+    // space after `>` in the original line (e.g. `>>- one`, where `>` is
+    // directly followed by `-`), re-matching the quote eats one of the
+    // inserted spaces as its optional space, so the content lands one
+    // column short of contentIndent; insert one extra space.
+    const parentIsQuoteNoSpace = tip0.t === 'quote' && off > 0 && line.charCodeAt(off - 1) !== 32;
+    this.lines[this.i] = line.slice(0, off) + ' '.repeat(parentIsQuoteNoSpace ? col + 1 : col) + line.slice(q);
     // Do not advance i: the rewritten line is reprocessed inside the item.
   }
 }
@@ -1142,6 +1426,7 @@ function parseInline(text, refs) {
   const out = [];       // chunks: strings, or delimiter records (objects)
   const delims = [];    // delimiter records (for *, _, ~~)
   const openers = [];   // '[' opener records for links/images
+  const pending = [];   // emphasis closers deferred by a live '['
   let buf = '';         // pending plain-text run
 
   const flush = () => { if (buf) { out.push(buf); buf = ''; } };
@@ -1149,7 +1434,9 @@ function parseInline(text, refs) {
 
   // Find the nearest opener (in `delims`) for `closer` (same char, can open,
   // not the closer itself), honouring the rule of 3. Returns the record or null.
-  function findOpener(closer) {
+  // With `ignoreBracket`, the link-boundary check is skipped (used to tell
+  // whether a closer is blocked ONLY by a bracket, so it can be deferred).
+  function findOpener(closer, ignoreBracket) {
     // A closer inside a potential link text ([...]) cannot pair with an
     // opener outside that link text: emphasis cannot span a link boundary.
     // Find the most recent active '[' opener before this closer.
@@ -1161,7 +1448,7 @@ function parseInline(text, refs) {
       const o = delims[k];
       if (o === closer || o.char !== closer.char || !o.canOpen || o.lit.length === 0) continue;
       // Skip openers outside the link text (at or before the '[').
-      if (bracketIdx !== -1 && o.idx <= bracketIdx) continue;
+      if (!ignoreBracket && bracketIdx !== -1 && o.idx <= bracketIdx) continue;
       // Skip openers inside an already-closed emphasis span: an opener
       // enclosed by a paired opener/closer (same char, both tagged)
       // cannot pair with a closer outside that span.
@@ -1215,6 +1502,27 @@ function parseInline(text, refs) {
       }
       if (closer.lit.length > 0) o = findOpener(closer);
     }
+    // Deferred pairing: if this closer could pair with an opener but for
+    // the link boundary, remember it. When the '[' resolves, the closer
+    // pairs if no link formed, and stays literal if one did.
+    if (closer.lit.length > 0 && findOpener(closer, true) && !pending.includes(closer)) pending.push(closer);
+  }
+
+  // Re-run deferred closers (after a '[' failed to form a link, or at the
+  // end of the text where no link can form). Closers still blocked by a
+  // live bracket, or with no opener even ignoring brackets, are dropped
+  // from the pending list (the latter can never pair: openers only
+  // precede a closer).
+  function flushPending() {
+    if (!pending.length) return;
+    const keep = [];
+    for (const d of pending) {
+      if (d.lit.length === 0) continue;
+      processEmphasis(d);
+      if (d.lit.length > 0 && findOpener(d, true)) keep.push(d);
+    }
+    pending.length = 0;
+    for (const d of keep) pending.push(d);
   }
 
   // Try to form a link/image from the opener at `openers[oi]` and the text
@@ -1376,7 +1684,7 @@ function parseInline(text, refs) {
       let oi = -1;
       for (let k = openers.length - 1; k >= 0; k--) {
         const o = openers[k];
-        if (o.blocked) { openers.splice(k, 1); break; }
+        if (o.blocked) { openers.splice(k, 1); flushPending(); break; }
         if (o.active) { oi = k; break; }
       }
       if (oi === -1) { buf += ']'; i++; continue; }
@@ -1388,7 +1696,13 @@ function parseInline(text, refs) {
         // tries the next-outer opener (nested brackets belong to the
         // outermost link whose text ends at a matching ']').
         opener.active = false;
+        flushPending();
         buf += ']'; i++; continue;
+      }
+      // A link formed: deferred closers inside its text stay literal
+      // (they cannot pair across the link boundary).
+      for (let k = pending.length - 1; k >= 0; k--) {
+        if (pending[k].idx > opener.idx) pending.splice(k, 1);
       }
       i = next;
       continue;
@@ -1561,6 +1875,11 @@ function parseInline(text, refs) {
     i++;
   }
   flush();
+  // Unclosed '[' openers can never form a link: deferred closers blocked
+  // only by them may now pair. Deactivate the openers first so the
+  // bracket check in findOpener no longer blocks them.
+  for (const o of openers) o.active = false;
+  flushPending();
   // Render the chunks: delimiter records become their literal text plus any
   // emphasis tags; strings pass through.
   let result = '';
@@ -1656,25 +1975,57 @@ function renderBlock(node, refs, inTightList) {
       const tag = node.ordered ? 'ol' : 'ul';
       const startAttr = node.ordered && node.start !== 1 ? ' start="' + node.start + '"' : '';
       let s = '<' + tag + startAttr + '>\n';
-      for (const item of node.children) {
+      for (let ii = 0; ii < node.children.length; ii++) {
+        const item = node.children[ii];
         let inner = '';
         for (let k = 0; k < item.children.length; k++) {
           const child = item.children[k];
           let cs;
+          // A paragraph in a tight item renders bare unless it is a
+          // post-list paragraph (a sub-list precedes it in the item):
+          // post-list paragraphs are wrapped in <p> tags.
+          const barePara = child.t === 'para' && node.tight && !child._postList;
+          // Paragraph text adjustments (render time, structural):
+          // - a blank-line trailing line is dropped when the enclosing
+          //   list stayed tight (see the blank-line site): the text ends
+          //   with one newline from _keepTrailing, and only that newline
+          //   is removed here; in a loose list the text is kept.
+          // - trailing spaces of the last line are stripped when the
+          //   paragraph is the last child of its item AND its item is the
+          //   last item of the list (tight or loose); they are kept when
+          //   another item follows or another block follows in the item.
+          let ptext = child.t === 'para' ? child.text : null;
+          if (ptext !== null) {
+            if (node.tight && child._trailingPending) ptext = ptext.replace(/\n$/, '');
+            if (k === item.children.length - 1 && ii === node.children.length - 1) ptext = ptext.replace(/[ \t]+(\n)?$/, '$1');
+          }
           // Task list: the item's first paragraph may start with [ ] / [x].
-          const tm = k === 0 && child.t === 'para' ? taskMarker(child.text) : null;
+          const tm = k === 0 && child.t === 'para' ? taskMarker(ptext) : null;
           if (tm) {
             const box = tm.checked
               ? '<input checked="" disabled="" type="checkbox">'
               : '<input disabled="" type="checkbox">';
-            if (node.tight) cs = box + parseInline(tm.rest.replace(/[ \t]+$/, ''), refs);
+            if (node.tight) cs = box + parseInline(tm.rest, refs);
             else cs = '<p>' + box + parseInline(tm.rest, refs) + '</p>\n';
-          } else if (child.t === 'para' && node.tight) cs = parseInline(child.text.replace(/[ \t]+$/, ''), refs);
+          } else if (barePara) cs = parseInline(ptext, refs);
+          else if (child.t === 'para') cs = '<p>' + parseInline(ptext, refs) + '</p>\n';
           else cs = renderBlock(child, refs, node.tight);
           inner += cs;
-          // A tight paragraph is followed directly by the next block (no
-          // newline); other children already end with one.
-          if (k < item.children.length - 1 && !cs.endsWith('\n') && !(child.t === 'para' && node.tight)) inner += '\n';
+          // Separators between an item's children: a tight paragraph is
+          // followed directly by a non-paragraph block (no newline), but
+          // two paragraphs in a tight item are separated by a blank line
+          // (the seal rule can split a paragraph with no blank line in
+          // the source, e.g. `  1. foo\n    bar\n     baz`). A paragraph
+          // that follows a non-paragraph block in a tight item is wrapped
+          // in <p> tags (e.g. a paragraph after a nested list or a
+          // heading); a bare paragraph ends without a newline, so the
+          // blank line is two newlines, while a <p> paragraph already ends
+          // with one, so the blank line is one more.
+          if (k < item.children.length - 1) {
+            const next = item.children[k + 1];
+            if (child.t === 'para' && node.tight && next.t === 'para') inner += barePara ? '\n\n' : '\n';
+            else if (!cs.endsWith('\n') && !(child.t === 'para' && node.tight)) inner += '\n';
+          }
         }
         s += '<li>' + inner + '</li>\n';
       }
